@@ -24,6 +24,7 @@ import { createAgentRunner, buildRecapRequest } from "./agent.js";
 import { Orchestrator, STOP_REASONS } from "./orchestrator.js";
 import { createSystemAdapter } from "./system-adapter.js";
 import { parseAiCommand, HELP_TEXT } from "./commands.js";
+import { buildPersonasRequest, parsePersonasResponse, temperamentLabel } from "./persona.js";
 import {
   registerSettings,
   getLoopConfig,
@@ -101,7 +102,7 @@ Hooks.once("ready", async () => {
   });
 
   const mod = game.modules.get(MODULE_ID);
-  if (mod) mod.api = { orchestrator: state.orchestrator, api: state.api, adapter: state.adapter };
+  if (mod) mod.api = { orchestrator: state.orchestrator, api: state.api, adapter: state.adapter, suggestPersonas };
 
   if (isActiveGM()) await cleanupIndicators();
 });
@@ -166,13 +167,21 @@ Hooks.on("createChatMessage", async (message, options, userId) => {
 /* Агенты и сцена                                                      */
 /* ------------------------------------------------------------------ */
 
-/** Агенты из настроек с актуальными именами актёров: [{ id, actorId, name, passport, enabled }]. */
+/** Агенты из настроек с актуальными именами актёров: [{ id, actorId, name, enabled, model, persona, temperament }]. */
 function getAgents() {
   return getAgentRecords()
     .map((r) => {
       const actor = r.actorId ? game.actors.get(r.actorId) : null;
       if (!actor) return null;
-      return { id: actor.id, actorId: actor.id, name: actor.name, passport: r.passport, enabled: r.enabled };
+      return {
+        id: actor.id,
+        actorId: actor.id,
+        name: actor.name,
+        enabled: r.enabled,
+        model: r.model,
+        persona: r.persona,
+        temperament: r.temperament,
+      };
     })
     .filter(Boolean);
 }
@@ -252,14 +261,16 @@ function allMessages() {
 async function buildAgentContext(agent) {
   const cfg = getLoopConfig();
   const actor = game.actors.get(agent.actorId);
+  // О других персонажах агент знает только то, что видно со стороны: имя, темперамент, «каким его видят».
   const others = getAgents()
     .filter((a) => a.enabled && a.actorId !== agent.actorId)
-    .map((a) => a.name);
+    .map((a) => ({ name: a.name, temperament: a.temperament, publicFace: a.persona.publicFace }));
   return {
     name: agent.name,
     systemTitle: state.adapter?.title ?? game.system.title,
     others,
-    passport: agent.passport,
+    persona: agent.persona,
+    temperament: agent.temperament,
     sheet: actor ? state.adapter.summarizeActor(actor) : "",
     notes: formatNotes(actor?.getFlag(MODULE_ID, "notes")),
     chronicle: readChronicle(CHRONICLE_PROMPT_CHARS),
@@ -374,6 +385,32 @@ async function cleanupIndicators() {
 function reportUnexpected(err) {
   console.error(`${MODULE_ID} |`, err);
   if (isActiveGM()) whisperGM(`<p><b>Внутренняя ошибка модуля:</b> ${escapeHtml(err?.message || err)}</p>`).catch(() => {});
+}
+
+/* ------------------------------------------------------------------ */
+/* «Придумать разные характеры» (кнопка в окне агентов)                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * slots: [{ slot, actorId, name, persona, temperament }] — то, что сейчас в форме.
+ * Возвращает [{ slot, persona, temperament }] или бросает Error с понятным текстом.
+ */
+async function suggestPersonas(slots) {
+  if (!game.user.isGM) throw new Error("доступно только мастеру");
+  const cfg = getLoopConfig();
+  const body = buildPersonasRequest({
+    model: cfg.model,
+    effort: cfg.effort,
+    systemTitle: state.adapter?.title ?? game.system.title,
+    slots: slots.map((s) => {
+      const actor = game.actors.get(s.actorId);
+      return { ...s, sheet: actor ? state.adapter.summarizeActor(actor) : "" };
+    }),
+  });
+  const data = await state.api.messages(body);
+  const parsed = parsePersonasResponse(data);
+  if (!parsed.ok) throw new Error(`модель вернула непонятный ответ (${parsed.reason}), попробуйте ещё раз`);
+  return parsed.characters;
 }
 
 /* ------------------------------------------------------------------ */
@@ -515,7 +552,12 @@ async function handleCommand(cmd) {
       const u = state.api.usage;
       const agents = getAgents();
       const list = agents.length
-        ? agents.map((a) => `${escapeHtml(a.name)}${a.enabled ? "" : " (выключен)"}`).join(", ")
+        ? agents
+            .map((a) => {
+              const bits = [temperamentLabel(a.temperament), a.model ? `модель ${a.model}` : "", a.enabled ? "" : "выключен"].filter(Boolean);
+              return `${escapeHtml(a.name)}${bits.length ? ` (${escapeHtml(bits.join("; "))})` : ""}`;
+            })
+            .join(", ")
         : "не настроены";
       return whisperGM(
         `<p><b>ИИ-игроки — статус</b></p><ul>` +

@@ -5,6 +5,14 @@
  */
 
 import { MODULE_ID, escapeHtml, normalizeSceneState } from "./visibility.js";
+import {
+  PERSONA_FIELDS,
+  TEMPERAMENT,
+  TEMPERAMENT_AXES,
+  distinctnessWarnings,
+  mergeSuggestion,
+  normalizeAgentRecord,
+} from "./persona.js";
 
 export const MAX_AGENTS = 4;
 export const DEFAULT_MODEL = "claude-sonnet-5-5";
@@ -133,19 +141,18 @@ export function getLoopConfig() {
   };
 }
 
-/** Сырые записи агентов: [{ actorId, passport, enabled }] — до четырёх, в порядке слотов. */
+/**
+ * Записи агентов: [{ actorId, enabled, model, persona, temperament }] — до четырёх, в порядке слотов.
+ * Старый формат (свободный «паспорт») переносится в поле анкеты «Прочее».
+ */
 export function getAgentRecords() {
   const raw = getSetting("agents");
   const list = Array.isArray(raw?.list) ? raw.list : [];
-  return list.slice(0, MAX_AGENTS).map((r) => ({
-    actorId: r?.actorId || "",
-    passport: String(r?.passport || ""),
-    enabled: r?.enabled !== false,
-  }));
+  return list.slice(0, MAX_AGENTS).map(normalizeAgentRecord);
 }
 
 export async function setAgentRecords(records) {
-  await setSetting("agents", { list: records.slice(0, MAX_AGENTS) });
+  await setSetting("agents", { list: records.slice(0, MAX_AGENTS).map(normalizeAgentRecord) });
 }
 
 export function getSceneState() {
@@ -162,6 +169,51 @@ export async function setSceneState(state) {
 
 let AgentsConfigClass = null;
 
+const PLACEHOLDERS = {
+  goal: "Чего он хочет добиться? Например: выплатить долг за корабль любой ценой",
+  fear: "Чего боится? Например: снова попасть в тюрьму",
+  flaw: "Слабость: азарт, жадность, вспыльчивость, доверчивость…",
+  voice: "Как говорит: коротко и грубо / витиевато / с шуточками / сухо, как отчёт",
+  sample: "2–3 характерные фразы: «Деньги вперёд.» «Я бы не стал…»",
+  relations: "Как относится к остальным по именам: кому верит, кого презирает",
+  publicFace: "Как выглядит для остальных (без тайн): «вечно хмурый механик»",
+  extra: "Всё остальное, что важно для игры",
+};
+
+/** Прочитать все слоты из формы. */
+function readForm(form) {
+  const el = (n) => form.elements[n];
+  const records = [];
+  for (let i = 0; i < MAX_AGENTS; i++) {
+    const persona = {};
+    for (const [k] of PERSONA_FIELDS) persona[k] = el(`p-${i}-${k}`)?.value ?? "";
+    const temperament = {};
+    for (const a of TEMPERAMENT_AXES) temperament[a] = el(`t-${i}-${a}`)?.value ?? "normal";
+    records.push(
+      normalizeAgentRecord({
+        actorId: el(`actor-${i}`)?.value || "",
+        enabled: !!el(`enabled-${i}`)?.checked,
+        model: el(`model-${i}`)?.value || "",
+        persona,
+        temperament,
+      }),
+    );
+  }
+  return records;
+}
+
+/** Записать один слот обратно в форму (после «Придумать разные характеры»). */
+function writeSlot(form, i, record) {
+  for (const [k] of PERSONA_FIELDS) {
+    const f = form.elements[`p-${i}-${k}`];
+    if (f) f.value = record.persona[k] ?? "";
+  }
+  for (const a of TEMPERAMENT_AXES) {
+    const f = form.elements[`t-${i}-${a}`];
+    if (f) f.value = record.temperament[a];
+  }
+}
+
 /** Класс создаётся лениво: foundry.applications.api доступен только внутри Foundry. */
 export function getAgentsConfigClass() {
   if (AgentsConfigClass) return AgentsConfigClass;
@@ -172,9 +224,10 @@ export function getAgentsConfigClass() {
       id: "ai-players-agents",
       tag: "form",
       classes: ["ai-players-config"],
-      window: { title: "ИИ-игроки: агенты", icon: "fa-solid fa-users", contentClasses: ["standard-form"] },
-      position: { width: 680, height: "auto" },
+      window: { title: "ИИ-игроки: агенты", icon: "fa-solid fa-users", contentClasses: ["standard-form"], resizable: true },
+      position: { width: 760, height: 820 },
       form: { handler: AgentsConfig.#onSubmit, closeOnSubmit: true },
+      actions: { suggest: AgentsConfig.#onSuggest },
     };
 
     async _prepareContext() {
@@ -184,7 +237,7 @@ export function getAgentsConfigClass() {
         .sort((a, b) => a.name.localeCompare(b.name, "ru"));
       const records = getAgentRecords();
       const slots = [];
-      for (let i = 0; i < MAX_AGENTS; i++) slots.push(records[i] || { actorId: "", passport: "", enabled: true });
+      for (let i = 0; i < MAX_AGENTS; i++) slots.push(records[i] || normalizeAgentRecord({}));
       return { candidates, slots };
     }
 
@@ -198,14 +251,27 @@ export function getAgentsConfigClass() {
               ? `<option value="${escapeHtml(s.actorId)}" selected>${escapeHtml(game.actors.get(s.actorId).name)}</option>`
               : "";
           const options = candidates
-            .map(
-              (a) =>
-                `<option value="${escapeHtml(a.id)}"${a.id === s.actorId ? " selected" : ""}>${escapeHtml(a.name)}</option>`,
-            )
+            .map((a) => `<option value="${escapeHtml(a.id)}"${a.id === s.actorId ? " selected" : ""}>${escapeHtml(a.name)}</option>`)
             .join("");
+          const title = s.actorId ? escapeHtml(game.actors.get(s.actorId)?.name ?? "?") : L("Agents.NoActor");
+          const temper = TEMPERAMENT_AXES.map((axis) => {
+            const opts = Object.entries(TEMPERAMENT[axis].options)
+              .map(([v, o]) => `<option value="${v}"${s.temperament[axis] === v ? " selected" : ""}>${escapeHtml(o.label)}</option>`)
+              .join("");
+            return `<label class="ai-players-temper">${escapeHtml(TEMPERAMENT[axis].title)}
+                      <select name="t-${i}-${axis}">${opts}</select></label>`;
+          }).join("");
+          const fields = PERSONA_FIELDS.map(
+            ([k, label]) => `
+              <div class="form-group stacked">
+                <label>${escapeHtml(label)}</label>
+                <textarea name="p-${i}-${k}" rows="${k === "sample" || k === "extra" ? 2 : 1}"
+                  placeholder="${escapeHtml(PLACEHOLDERS[k])}">${escapeHtml(s.persona[k])}</textarea>
+              </div>`,
+          ).join("");
           return `
-          <fieldset class="ai-players-slot">
-            <legend>${L("Agents.Slot")} ${i + 1}</legend>
+          <details class="ai-players-slot" open>
+            <summary>${L("Agents.Slot")} ${i + 1}: ${title}</summary>
             <div class="form-group">
               <label>${L("Agents.Actor")}</label>
               <div class="form-fields">
@@ -215,15 +281,25 @@ export function getAgentsConfigClass() {
                 <label class="checkbox"><input type="checkbox" name="enabled-${i}"${s.enabled ? " checked" : ""}> ${L("Agents.Enabled")}</label>
               </div>
             </div>
-            <div class="form-group stacked">
-              <label>${L("Agents.Passport")}</label>
-              <textarea name="passport-${i}" rows="5" placeholder="${escapeHtml(L("Agents.PassportPlaceholder"))}">${escapeHtml(s.passport)}</textarea>
+            <div class="form-group"><label>Темперамент</label><div class="form-fields">${temper}</div></div>
+            ${fields}
+            <div class="form-group">
+              <label>Своя модель</label>
+              <div class="form-fields">
+                <input type="text" name="model-${i}" value="${escapeHtml(s.model)}" placeholder="пусто — общая модель из настроек">
+              </div>
             </div>
-          </fieldset>`;
+          </details>`;
         })
         .join("");
       return `
         <p class="hint">${L("Agents.Hint")}</p>
+        <p class="hint">Чтобы персонажи звучали по-разному, у каждого должны быть своя цель, свой темперамент и своя манера речи.
+          Кнопка ниже заполнит пустые поля так, чтобы группа получилась контрастной (один запрос к модели).
+          Заполненное вами не меняется.</p>
+        <button type="button" data-action="suggest" class="ai-players-suggest">
+          <i class="fa-solid fa-wand-magic-sparkles"></i> Придумать разные характеры
+        </button>
         ${slotHtml}
         <footer class="form-footer">
           <button type="submit"><i class="fa-solid fa-floppy-disk"></i> ${L("Agents.Save")}</button>
@@ -234,22 +310,56 @@ export function getAgentsConfigClass() {
       content.innerHTML = result;
     }
 
+    /** «Придумать разные характеры»: заполнить пустые поля в форме (без сохранения). */
+    static async #onSuggest(event, target) {
+      const form = this.element;
+      const records = readForm(form);
+      const slots = records
+        .map((r, i) => ({ ...r, index: i, slot: i + 1, name: game.actors.get(r.actorId)?.name }))
+        .filter((r) => r.actorId && r.name);
+      if (!slots.length) return ui.notifications.warn("Сначала выберите актёров хотя бы в одном слоте.");
+      const api = game.modules.get(MODULE_ID)?.api;
+      if (!api?.suggestPersonas) return ui.notifications.error("Модуль ещё не готов: войдите в мир мастером.");
+
+      const label = target.innerHTML;
+      target.disabled = true;
+      target.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Придумываю…`;
+      try {
+        const suggestions = await api.suggestPersonas(slots);
+        let n = 0;
+        for (const sug of suggestions) {
+          const slot = slots.find((s) => s.slot === sug.slot);
+          if (!slot) continue;
+          writeSlot(form, slot.index, mergeSuggestion(records[slot.index], sug));
+          n++;
+        }
+        ui.notifications.info(`Готово: предложены характеры для ${n} персонажей. Проверьте, поправьте и нажмите «Сохранить».`);
+      } catch (err) {
+        ui.notifications.error(`Не удалось придумать характеры: ${err?.message || err}`);
+      } finally {
+        target.disabled = false;
+        target.innerHTML = label;
+      }
+    }
+
     static async #onSubmit(event, form) {
       const records = [];
       const seen = new Set();
-      for (let i = 0; i < MAX_AGENTS; i++) {
-        const actorId = form.elements[`actor-${i}`]?.value || "";
-        const passport = form.elements[`passport-${i}`]?.value || "";
-        const enabled = !!form.elements[`enabled-${i}`]?.checked;
-        if (actorId && seen.has(actorId)) {
+      for (const r of readForm(form)) {
+        if (r.actorId && seen.has(r.actorId)) {
           ui.notifications.warn(L("Agents.Duplicate"));
           continue;
         }
-        if (actorId) seen.add(actorId);
-        records.push({ actorId, passport, enabled });
+        if (r.actorId) seen.add(r.actorId);
+        records.push(r);
       }
       await setAgentRecords(records);
       ui.notifications.info(L("Agents.Saved"));
+
+      const active = records
+        .filter((r) => r.actorId && r.enabled)
+        .map((r) => ({ ...r, name: game.actors.get(r.actorId)?.name ?? "?" }));
+      for (const w of distinctnessWarnings(active).slice(0, 4)) ui.notifications.warn(w, { permanent: true });
     }
   }
 

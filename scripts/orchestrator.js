@@ -156,6 +156,7 @@ export class Orchestrator {
     await deps.setRotation(rotation + 1);
 
     const outcomes = new Map(); // id → последний declare/ask_gm этого агента в цикле
+    const recent = []; // реплики цикла [{ name, text }] — для защиты от эха
     let requests = 0;
     let rounds = 0;
     let reason = null;
@@ -177,7 +178,7 @@ export class Orchestrator {
         await deps.setIndicator(agent);
         let turn;
         try {
-          turn = await deps.runAgent(agent, { round, maxRounds, maxAttempts: Math.min(2, budget), signal });
+          turn = await deps.runAgent(agent, { round, maxRounds, maxAttempts: Math.min(2, budget), signal, recent: recent.slice() });
         } finally {
           if (this.gen === gen) await deps.setIndicator(null);
         }
@@ -198,6 +199,7 @@ export class Orchestrator {
         const act = turn.act;
         if (act.action !== "pass") {
           allPassed = false;
+          recent.push({ name: agent.name, text: act.text });
           await deps.postAction(agent, act);
         }
         if (act.thought) await deps.postThought(agent, act);

@@ -17,5 +17,11 @@
 
 /* Окно агентов */
 .ai-players-config .ai-players-slot { margin-bottom: 8px; }
-.ai-players-config textarea { width: 100%; min-height: 6em; resize: vertical; }
+.ai-players-config textarea { width: 100%; resize: vertical; }
 .ai-players-config .checkbox { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+.ai-players-config .window-content { overflow-y: auto; }
+.ai-players-config details.ai-players-slot { border: 1px solid var(--color-border, #999); border-radius: 6px; padding: 4px 8px 8px; margin-bottom: 8px; }
+.ai-players-config details.ai-players-slot > summary { cursor: pointer; font-weight: bold; padding: 4px 0; }
+.ai-players-config textarea { min-height: 2.2em; }
+.ai-players-config .ai-players-temper { display: flex; flex-direction: column; font-size: 0.85em; gap: 2px; flex: 1; }
+.ai-players-config .ai-players-suggest { width: 100%; margin: 4px 0 10px; }

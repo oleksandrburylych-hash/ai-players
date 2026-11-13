@@ -9,6 +9,7 @@ import { Orchestrator } from "../scripts/orchestrator.js";
 import { createAgentRunner } from "../scripts/agent.js";
 import { createApi } from "../scripts/api.js";
 import { activeParticipants, currentAudience, formatNotes, transcriptFor } from "../scripts/visibility.js";
+import { normalizeAgentRecord } from "../scripts/persona.js";
 
 /** Ответ API с вызовом инструмента act. */
 export function actResponse(action, text = "", extra = {}) {
@@ -73,7 +74,10 @@ export function deferred() {
  */
 export function createWorld({ agents, scene = { all: true, ids: [] }, respond, config = {} }) {
   const world = {
-    agents: agents.map((a) => ({ id: a.actorId, enabled: true, passport: "", ...a })),
+    agents: agents.map((a) => {
+      const r = normalizeAgentRecord(a);
+      return { id: r.actorId, name: a.name, ...r };
+    }),
     scene,
     notes: {}, // actorId → [{text, at}]
     messages: [], // нормализованные сообщения (как их отдаёт main.js)
@@ -125,8 +129,11 @@ export function createWorld({ agents, scene = { all: true, ids: [] }, respond, c
   const getContext = async (agent) => ({
     name: agent.name,
     systemTitle: "Mongoose Traveller 2e",
-    others: world.agents.filter((a) => a.actorId !== agent.actorId).map((a) => a.name),
-    passport: agent.passport,
+    others: world.agents
+      .filter((a) => a.actorId !== agent.actorId)
+      .map((a) => ({ name: a.name, temperament: a.temperament, publicFace: a.persona.publicFace })),
+    persona: agent.persona,
+    temperament: agent.temperament,
     sheet: `Лист: ${agent.name}`,
     notes: formatNotes(world.notes[agent.actorId]),
     chronicle: "",

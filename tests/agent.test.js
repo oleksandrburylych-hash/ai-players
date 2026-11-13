@@ -104,7 +104,7 @@ test("запрос агента: инструмент act, auto, без прин
     model: "claude-sonnet-5-5",
     maxTokens: 400,
     effort: "low",
-    system: buildSystemPrompt({ name: "Вера", passport: "Трусиха" }),
+    system: buildSystemPrompt({ name: "Вера", persona: { fear: "Трусиха" } }),
     userText: "Твой ход, Вера.",
   });
   assert.equal(body.model, "claude-sonnet-5-5");

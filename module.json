@@ -2,7 +2,7 @@
   "id": "ai-players",
   "title": "ИИ-игроки",
   "description": "Четыре ИИ-агента (Claude, API Anthropic) играют за персонажей: отвечают в чате, спорят, задают вопросы мастеру и делают заявки. Мастер — человек.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "compatibility": {
     "minimum": "13",
     "verified": "13"

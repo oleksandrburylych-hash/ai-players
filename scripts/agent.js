@@ -6,6 +6,7 @@
  */
 
 import { modelTuning, isAbortError } from "./api.js";
+import { echoReason, formatPersona, temperamentLabel, temperamentRules } from "./persona.js";
 
 export const ACTIONS = ["pass", "say", "ask_gm", "declare"];
 
@@ -79,13 +80,16 @@ const MAX_THOUGHT = 300;
  * Системный промт агента. Возвращается массивом блоков: так на него можно повесить
  * cache_control — в пределах сцены промт одного агента не меняется, и повторные круги
  * читаются из кэша.
+ *
+ * persona — анкета (persona.js), temperament — переключатели; passport — старый
+ * свободный текст (если анкеты нет). others — [{ name, publicFace, temperament }] или строки.
  */
-export function buildSystemPrompt({ name, systemTitle, others = [], passport, sheet, notes, chronicle }) {
+export function buildSystemPrompt({ name, systemTitle, others = [], persona, temperament, passport, sheet, notes, chronicle }) {
   const parts = [];
   parts.push(
     `Ты — игрок за столом настольной ролевой игры${systemTitle ? ` «${systemTitle}»` : ""}. ` +
-      `Твой персонаж — ${name}. Мастер — человек.` +
-      (others.length ? ` Другие персонажи группы: ${others.join(", ")} — за них играют другие игроки.` : ""),
+      `Твой персонаж — ${name}. Мастер — человек. За остальных персонажей играют другие игроки, ` +
+      `и у каждого из них свой характер, совсем не такой, как у тебя.`,
   );
   parts.push("## Правила игры за столом\n" + TABLE_RULES.map((r) => `- ${r}`).join("\n"));
   parts.push(
@@ -97,9 +101,46 @@ export function buildSystemPrompt({ name, systemTitle, others = [], passport, sh
       "- declare — заявка: что персонаж делает, чем и зачем.\n" +
       "Поле thought — одна короткая строка для мастера, другие игроки её не видят.\n" +
       "roll_request заполняй, только если заявка явно требует проверки; иначе оставь поля пустыми.\n" +
-      "Если ты уже сделал заявку и менять её незачем — выбирай pass.",
+      "Если ты уже сделал заявку и менять её незачем — выбирай pass.\n" +
+      "Не повторяй и не пересказывай то, что уже сказали другие или ты сам. Если согласен с кем-то — " +
+      "добавь своё (довод, условие, сомнение, цену) или выбери pass. Простое «согласен» — это pass.",
   );
-  parts.push("## Паспорт персонажа\n" + (String(passport || "").trim() || "(не заполнен — играй по листу и здравому смыслу)"));
+
+  const p = persona || {};
+  const card = formatPersona(p);
+  parts.push(
+    "## Твой персонаж\n" +
+      (card || String(passport || "").trim() || "(анкета не заполнена — играй по листу и здравому смыслу)") +
+      (card && passport && String(passport).trim() ? `\n${String(passport).trim()}` : ""),
+  );
+
+  const voice = String(p.voice || "").trim();
+  const sample = String(p.sample || "").trim();
+  parts.push(
+    "## Твой голос\n" +
+      (voice ? `Манера речи: ${voice}\n` : "") +
+      (sample ? `Так ты говоришь (это образцы стиля, не повторяй их дословно): ${sample}\n` : "") +
+      "Говори так, чтобы по одной реплике было понятно, что это именно ты: свой словарь, свой ритм, свои привычки. " +
+      "Не подстраивайся под стиль других игроков.",
+  );
+
+  const rules = temperamentRules(temperament);
+  if (rules.length) parts.push("## Твой темперамент\n" + rules.map((r) => `- ${r}`).join("\n"));
+
+  if (others.length) {
+    const lines = others.map((o) => {
+      if (typeof o === "string") return `- ${o}`;
+      const t = temperamentLabel(o.temperament);
+      const face = String(o.publicFace || "").trim();
+      return `- ${o.name}${t ? ` (${t})` : ""}${face ? ` — ${face}` : ""}`;
+    });
+    parts.push(
+      "## Остальные в группе (какими ты их видишь со стороны)\n" +
+        lines.join("\n") +
+        "\nТы — не они. Держись своей цели и своего взгляда, даже когда они звучат убедительно.",
+    );
+  }
+
   if (sheet && String(sheet).trim()) parts.push("## Лист персонажа (кратко)\n" + String(sheet).trim());
   if (notes && String(notes).trim()) {
     parts.push("## Личные заметки (это знает только твой персонаж, другие — нет)\n" + String(notes).trim());
@@ -198,34 +239,49 @@ export function parseActResponse(data) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Выполнить ход: запрос → разбор; если не разобралось — один повтор (если позволяет
- * бюджет запросов), затем pass с предупреждением.
+ * Выполнить ход: запрос → разбор → проверка; если не разобралось или не прошло проверку —
+ * один повтор (если позволяет бюджет запросов), затем pass.
+ *
+ * validate(act) → null | строка-причина: например, «повторяет реплику Веры». Такой ответ
+ * считается неудачным, а при повторе модель получает подсказку через onRetry(request, reason).
  *
  * Возвращает одно из:
  *   { act, requests }                       — успешно
- *   { act: PASS, requests, warning }        — не разобралось, считаем pass
+ *   { act: PASS, requests, warning? }       — не вышло, считаем pass (warning — для мастера)
  *   { error, requests }                     — ошибка API: цикл надо остановить
  *   { aborted: true, requests }             — цикл прерван
  */
-export async function takeTurn({ callModel, request, maxAttempts = 2, signal }) {
+export async function takeTurn({ callModel, request, maxAttempts = 2, signal, validate, onRetry }) {
   const attempts = Math.max(1, Math.min(2, maxAttempts));
   let requests = 0;
   let lastReason = "";
+  let lastKind = "";
+  let req = request;
   for (let i = 0; i < attempts; i++) {
+    if (i > 0 && onRetry) req = onRetry(request, lastReason, lastKind);
     if (signal?.aborted) return { aborted: true, requests };
     let data;
     try {
       requests += 1;
-      data = await callModel(request, { signal });
+      data = await callModel(req, { signal });
     } catch (err) {
       if (isAbortError(err) || signal?.aborted) return { aborted: true, requests };
       return { error: err, requests };
     }
     if (signal?.aborted) return { aborted: true, requests };
     const parsed = parseActResponse(data);
-    if (parsed.ok) return { act: parsed.act, requests };
-    lastReason = parsed.reason;
+    if (!parsed.ok) {
+      lastReason = parsed.reason;
+      lastKind = "parse";
+      continue;
+    }
+    const rejected = validate ? validate(parsed.act) : null;
+    if (!rejected) return { act: parsed.act, requests };
+    lastReason = rejected;
+    lastKind = "echo";
   }
+  // Эхо после повтора — не ошибка: персонажу нечего добавить, он молчит. Мастера не тревожим.
+  if (lastKind === "echo") return { act: { ...PASS }, requests, note: lastReason };
   return {
     act: { ...PASS },
     requests,
@@ -240,18 +296,36 @@ export async function takeTurn({ callModel, request, maxAttempts = 2, signal }) 
  * Собрать исполнителя ходов. Все зависимости — снаружи.
  *
  * @param {object} deps
- * @param {Function} deps.getContext  async (agent, {single}) => { name, systemTitle, others, passport, sheet, notes, chronicle, transcript }
+ * @param {Function} deps.getContext  async (agent, {single}) => { name, systemTitle, others, persona, temperament,
+ *                                     passport, sheet, notes, chronicle, transcript }
  * @param {Function} deps.callModel   async (body, {signal}) => response JSON
  * @param {Function} deps.getConfig   () => { model, maxTokens, effort }
+ *
+ * agent.model (если задан) заменяет общую модель для этого персонажа.
+ * opts.recent — реплики текущего цикла [{ name, text }] для защиты от эха.
  */
 export function createAgentRunner({ getContext, callModel, getConfig }) {
-  return async function runAgent(agent, { round = 1, maxRounds = 1, single = false, maxAttempts = 2, signal } = {}) {
+  return async function runAgent(agent, { round = 1, maxRounds = 1, single = false, maxAttempts = 2, signal, recent = [] } = {}) {
     const cfg = getConfig();
     const ctx = await getContext(agent, { single });
     const system = buildSystemPrompt(ctx);
     const userText = buildUserMessage({ name: ctx.name, transcript: ctx.transcript, round, maxRounds, single });
-    const request = buildAgentRequest({ model: cfg.model, maxTokens: cfg.maxTokens, effort: cfg.effort, system, userText });
-    return takeTurn({ callModel, request, maxAttempts, signal });
+    const model = String(agent.model || "").trim() || cfg.model;
+    const request = buildAgentRequest({ model, maxTokens: cfg.maxTokens, effort: cfg.effort, system, userText });
+    return takeTurn({
+      callModel,
+      request,
+      maxAttempts,
+      signal,
+      validate: (act) => echoReason(act, recent, ctx.name),
+      onRetry: (req, reason, kind) => {
+        const hint =
+          kind === "echo"
+            ? `\n\n(Ведущий: прошлый вариант не подошёл — ${reason}. Скажи что-то своё, своим голосом, со своей позиции — или выбери pass.)`
+            : `\n\n(Ведущий: прошлый ответ не удалось прочитать — ${reason}. Ответь ровно одним вызовом инструмента act.)`;
+        return { ...req, messages: [{ role: "user", content: req.messages[0].content + hint }] };
+      },
+    });
   };
 }
 
