@@ -1,0 +1,19 @@
+{
+  "id": "ai-players",
+  "title": "ИИ-игроки",
+  "description": "Четыре ИИ-агента (Claude, API Anthropic) играют за персонажей: отвечают в чате, спорят, задают вопросы мастеру и делают заявки. Мастер — человек.",
+  "version": "0.1.0",
+  "compatibility": {
+    "minimum": "13",
+    "verified": "13"
+  },
+  "authors": [
+    { "name": "Oleksandr Burylych" }
+  ],
+  "esmodules": ["scripts/main.js"],
+  "styles": ["styles/ai-players.css"],
+  "languages": [
+    { "lang": "ru", "name": "Русский", "path": "lang/ru.json" },
+    { "lang": "en", "name": "English", "path": "lang/ru.json" }
+  ]
+}
